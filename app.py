@@ -1,4 +1,4 @@
-# app.py
+# app.py (A4-safe PDF output)
 import os
 import io
 import time
@@ -15,36 +15,48 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 app = Flask(__name__)
 
-# Optional: simple API key protection. Set API_KEY env var on the host to enable.
 API_KEY = os.getenv("API_KEY")
 
-def control_chart_figure(series, dates, wc_name, figsize=(11, 8.5)):
-    """
-    Create a matplotlib Figure for the control chart.
-    Returns a matplotlib.figure.Figure object.
-    """
+# A4 sizes in inches
+A4_PORTRAIT = (8.27, 11.69)
+A4_LANDSCAPE = (11.69, 8.27)
+
+# Settings you can tweak
+FIGSIZE = A4_LANDSCAPE           # use A4 landscape as page size
+DPI = 120                        # reduce for speed (120 is fine); raise for higher quality
+PAD_INCHES = 0.6                 # padding when saving PDF to avoid clipping
+MIN_ROWS = 1                     # min rows to generate chart for a workcenter
+
+def control_chart_figure(series, dates, wc_name, figsize=FIGSIZE):
+    """Create and return a matplotlib Figure sized for an A4 page."""
     values = np.array(series, dtype=float)
-    # calculate CL, UCL, LCL
     mean = float(np.mean(values)) if len(values) else 0.0
     std = float(np.std(values, ddof=0)) if len(values) else 0.0
     UCL = mean + 3 * std
     LCL = max(mean - 3 * std, 0.0)
 
-    fig, ax = plt.subplots(figsize=figsize)
-    # plot points and line
+    # create fig with exact page dimensions
+    fig, ax = plt.subplots(figsize=figsize, dpi=DPI)
+
     ax.plot(dates, values, marker="o", linestyle="-", label="Scrap Qty")
-    # control lines
     ax.axhline(mean, color="green", linestyle="--", label=f"CL = {mean:.2f}")
     ax.axhline(UCL, color="red", linestyle="--", label=f"UCL = {UCL:.2f}")
     ax.axhline(LCL, color="orange", linestyle="--", label=f"LCL = {LCL:.2f}")
-    # labels and title
-    ax.set_title(f"Control Chart – Work Center: {wc_name}", fontsize=14)
-    ax.set_ylabel("Scrap Quantity")
-    ax.set_xlabel("Posting Date")
-    # rotate x ticks for readability
-    ax.tick_params(axis="x", rotation=30)
-    ax.legend(loc="upper left")
-    fig.tight_layout()
+
+    ax.set_title(f"Control Chart – Work Center: {wc_name}", fontsize=16)
+    ax.set_ylabel("Scrap Quantity", fontsize=12)
+    ax.set_xlabel("Posting Date", fontsize=12)
+
+    # improve tick label fit
+    ax.tick_params(axis="x", rotation=40, labelsize=9)
+    ax.tick_params(axis="y", labelsize=10)
+
+    # place legend inside plot but with enough room
+    ax.legend(loc="upper left", bbox_to_anchor=(0.01, 0.98))
+
+    # Adjust subplot params so title + ticks fit comfortably within A4 margins
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=0.14)
+
     return fig
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -57,7 +69,6 @@ def process():
     print("START /process", file=sys.stderr)
     sys.stderr.flush()
 
-    # API key check (optional)
     if API_KEY:
         recv_key = request.headers.get("x-api-key")
         if recv_key != API_KEY:
@@ -72,18 +83,14 @@ def process():
     except Exception as e:
         return jsonify({"error": f"Error reading Excel: {str(e)}"}), 400
 
-    # normalize column names
     df.columns = df.columns.astype(str).str.strip()
-
     required = ["Actual Work Center", "Posting Date", "Scrap Qty Breakup"]
     for col in required:
         if col not in df.columns:
             return jsonify({"error": f"Missing column: {col}"}), 400
 
-    # parse & clean
     df["Posting Date"] = pd.to_datetime(df["Posting Date"], errors="coerce")
     df = df.dropna(subset=["Posting Date"])
-    # ensure numeric scrap qty
     df["Scrap Qty Breakup"] = pd.to_numeric(df["Scrap Qty Breakup"], errors="coerce").fillna(0)
     df = df.sort_values("Posting Date")
 
@@ -91,38 +98,32 @@ def process():
     if len(workcenters) == 0:
         return jsonify({"error": "No work centers found in the data"}), 400
 
-    # Create figures for each workcenter
     figs = []
-    # Optional: you can filter workcenters by minimum rows, e.g., >=3
-    MIN_ROWS = 1  # change to 5 if you want to skip sparse groups
     for wc in workcenters:
         subset = df[df["Actual Work Center"] == wc]
         if subset.shape[0] < MIN_ROWS:
             continue
-        # use posting date and scrap qty
         dates = subset["Posting Date"]
         values = subset["Scrap Qty Breakup"]
         try:
-            fig = control_chart_figure(values, dates, wc, figsize=(11, 8.5))
+            fig = control_chart_figure(values, dates, wc, figsize=FIGSIZE)
             figs.append((wc, fig))
         except Exception as e:
-            # skip on plotting failure but log
-            print(f"Failed to plot workcenter {wc}: {e}", file=sys.stderr)
+            print(f"Failed to create chart for {wc}: {e}", file=sys.stderr)
             sys.stderr.flush()
             continue
 
     if len(figs) == 0:
         return jsonify({"error": "No charts produced (maybe no workcenters met MIN_ROWS)"}), 400
 
-    # Write all figures into a single PDF in-memory using PdfPages
     pdf_buffer = io.BytesIO()
     try:
         with PdfPages(pdf_buffer) as pdf:
             for wc, fig in figs:
-                # optional: adjust figure size before saving
-                # fig.set_size_inches(11, 8.5)  # landscape (already set)
-                fig.tight_layout(pad=1.0)
-                pdf.savefig(fig, bbox_inches="tight", dpi=150)
+                # ensure layout and then save with padding to prevent any clipping
+                fig.tight_layout()
+                # Save to the PDF with pad_inches (prevents cropping of titles/labels)
+                pdf.savefig(fig, bbox_inches="tight", pad_inches=PAD_INCHES)
                 plt.close(fig)
     except Exception as e:
         return jsonify({"error": f"PDF creation failed: {str(e)}"}), 500
@@ -141,5 +142,4 @@ def process():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # bind to all interfaces so Render/CloudRun can route traffic
     app.run(host="0.0.0.0", port=port)
