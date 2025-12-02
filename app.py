@@ -1,85 +1,61 @@
-# app.py (A4-safe PDF output)
-import os
+# app.py (return HTML with embedded charts)
 import io
-import time
+import base64
 import sys
+import time
 from datetime import datetime
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, Response, jsonify
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("API_KEY")
+# small helper: render matplotlib figure to base64 PNG
+def fig_to_base64_png(fig, dpi=120):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.3)
+    plt.close(fig)
+    buf.seek(0)
+    b64 = base64.b64encode(buf.read()).decode("utf-8")
+    return "data:image/png;base64," + b64
 
-# A4 sizes in inches
-A4_PORTRAIT = (8.27, 11.69)
-A4_LANDSCAPE = (11.69, 8.27)
-
-# Settings you can tweak
-FIGSIZE = A4_LANDSCAPE           # use A4 landscape as page size
-DPI = 120                        # reduce for speed (120 is fine); raise for higher quality
-PAD_INCHES = 0.6                 # padding when saving PDF to avoid clipping
-MIN_ROWS = 1                     # min rows to generate chart for a workcenter
-
-def control_chart_figure(series, dates, wc_name, figsize=FIGSIZE):
-    """Create and return a matplotlib Figure sized for an A4 page."""
+def control_chart_figure(series, dates, wc_name, figsize=(11, 6)):
     values = np.array(series, dtype=float)
     mean = float(np.mean(values)) if len(values) else 0.0
     std = float(np.std(values, ddof=0)) if len(values) else 0.0
     UCL = mean + 3 * std
     LCL = max(mean - 3 * std, 0.0)
 
-    # create fig with exact page dimensions
-    fig, ax = plt.subplots(figsize=figsize, dpi=DPI)
-
+    fig, ax = plt.subplots(figsize=figsize)
     ax.plot(dates, values, marker="o", linestyle="-", label="Scrap Qty")
     ax.axhline(mean, color="green", linestyle="--", label=f"CL = {mean:.2f}")
     ax.axhline(UCL, color="red", linestyle="--", label=f"UCL = {UCL:.2f}")
     ax.axhline(LCL, color="orange", linestyle="--", label=f"LCL = {LCL:.2f}")
-
-    ax.set_title(f"Control Chart – Work Center: {wc_name}", fontsize=16)
-    ax.set_ylabel("Scrap Quantity", fontsize=12)
-    ax.set_xlabel("Posting Date", fontsize=12)
-
-    # improve tick label fit
-    ax.tick_params(axis="x", rotation=40, labelsize=9)
-    ax.tick_params(axis="y", labelsize=10)
-
-    # place legend inside plot but with enough room
-    ax.legend(loc="upper left", bbox_to_anchor=(0.01, 0.98))
-
-    # Adjust subplot params so title + ticks fit comfortably within A4 margins
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=0.14)
-
+    ax.set_title(f"Control Chart – Work Center: {wc_name}", fontsize=14)
+    ax.set_ylabel("Scrap Quantity")
+    ax.set_xlabel("Posting Date")
+    ax.tick_params(axis="x", rotation=30)
+    ax.legend(loc="upper left")
+    fig.tight_layout()
     return fig
 
-@app.route("/", methods=["GET", "HEAD"])
+@app.route("/", methods=["GET"])
 def health():
-    return "OK - control-charts-api", 200
+    return "Control Chart HTML API", 200
 
 @app.route("/process", methods=["POST"])
 def process():
-    start_time = time.time()
-    print("START /process", file=sys.stderr)
-    sys.stderr.flush()
-
-    if API_KEY:
-        recv_key = request.headers.get("x-api-key")
-        if recv_key != API_KEY:
-            return jsonify({"error": "invalid api key"}), 401
+    start = time.time()
 
     if "file" not in request.files:
         return jsonify({"error": "Upload Excel file using 'file' field"}), 400
 
-    file = request.files["file"]
     try:
-        df = pd.read_excel(file)
+        df = pd.read_excel(request.files["file"])
     except Exception as e:
         return jsonify({"error": f"Error reading Excel: {str(e)}"}), 400
 
@@ -96,50 +72,57 @@ def process():
 
     workcenters = df["Actual Work Center"].dropna().unique()
     if len(workcenters) == 0:
-        return jsonify({"error": "No work centers found in the data"}), 400
+        return jsonify({"error": "No work centers found"}), 400
 
-    figs = []
+    charts_html = []
     for wc in workcenters:
         subset = df[df["Actual Work Center"] == wc]
-        if subset.shape[0] < MIN_ROWS:
+        if subset.empty:
             continue
-        dates = subset["Posting Date"]
-        values = subset["Scrap Qty Breakup"]
-        try:
-            fig = control_chart_figure(values, dates, wc, figsize=FIGSIZE)
-            figs.append((wc, fig))
-        except Exception as e:
-            print(f"Failed to create chart for {wc}: {e}", file=sys.stderr)
-            sys.stderr.flush()
-            continue
+        fig = control_chart_figure(subset["Scrap Qty Breakup"], subset["Posting Date"], wc, figsize=(11,6))
+        img_b64 = fig_to_base64_png(fig, dpi=120)
+        # each chart block: title + timestamp + img
+        block = f"""
+        <div class="chart-page">
+          <h2 class="page-title">Control Chart - Scrap Qty</h2>
+          <p class="generated">Generated: {datetime.now().isoformat()}</p>
+          <h3 class="wc-name">{wc}</h3>
+          <img class="chart-img" src="{img_b64}" alt="chart-{wc}" />
+        </div>
+        """
+        charts_html.append(block)
 
-    if len(figs) == 0:
-        return jsonify({"error": "No charts produced (maybe no workcenters met MIN_ROWS)"}), 400
+    html_template = f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Control Charts - Scrap Qty</title>
+        <style>
+          body {{ font-family: Arial, sans-serif; margin: 16px; }}
+          .chart-page {{ page-break-after: always; margin-bottom: 30px; }}
+          .page-title {{ text-align: left; font-size: 28px; margin: 8px 0; }}
+          .generated {{ font-size: 12px; color: #333; margin: 0 0 8px 0; }}
+          .wc-name {{ font-size: 18px; margin: 4px 0 12px 0; }}
+          .chart-img {{ display: block; max-width: 100%; height: auto; border: 1px solid #ddd; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
+          /* Helpful when printing to PDF */
+          @page {{ size: A4 portrait; margin: 12mm; }}
+        </style>
+      </head>
+      <body>
+        <h1>Control Charts - Scrap Qty</h1>
+        {"".join(charts_html)}
+      </body>
+    </html>
+    """
 
-    pdf_buffer = io.BytesIO()
-    try:
-        with PdfPages(pdf_buffer) as pdf:
-            for wc, fig in figs:
-                # ensure layout and then save with padding to prevent any clipping
-                fig.tight_layout()
-                # Save to the PDF with pad_inches (prevents cropping of titles/labels)
-                pdf.savefig(fig, bbox_inches="tight", pad_inches=PAD_INCHES)
-                plt.close(fig)
-    except Exception as e:
-        return jsonify({"error": f"PDF creation failed: {str(e)}"}), 500
+    elapsed = time.time() - start
+    # small log for diagnostics
+    print(f"/process generated {len(charts_html)} charts in {elapsed:.2f}s", file=sys.stderr)
 
-    pdf_buffer.seek(0)
-    elapsed = time.time() - start_time
-    print(f"FINISH /process time={elapsed:.2f}s pages={len(figs)}", file=sys.stderr)
-    sys.stderr.flush()
-
-    return send_file(
-        pdf_buffer,
-        mimetype="application/pdf",
-        as_attachment=True,
-        download_name="control_charts_scrap_qty.pdf"
-    )
+    return Response(html_template, mimetype="text/html")
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
